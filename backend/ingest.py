@@ -71,7 +71,7 @@ def is_already_ingested() -> bool:
     if not os.path.exists(CHROMA_DB_PATH):
         return False
     try:
-        client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+        client = chromadb.PersistentClient(path=CHROMA_DB_PATH, settings=Settings(anonymized_telemetry=False))
         collections = client.list_collections()
         for col in collections:
             if col.name == COLLECTION_NAME:
@@ -86,7 +86,7 @@ def is_already_ingested() -> bool:
 def get_collection_count() -> int:
     """Get the number of documents in the collection."""
     try:
-        client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+        client = chromadb.PersistentClient(path=CHROMA_DB_PATH, settings=Settings(anonymized_telemetry=False))
         collection = client.get_collection(COLLECTION_NAME)
         return collection.count()
     except Exception:
@@ -150,7 +150,7 @@ def ingest_data() -> dict:
 
     # Create ChromaDB client with persistent storage
     print(f"Creating ChromaDB persistent client at: {CHROMA_DB_PATH}")
-    client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+    client = chromadb.PersistentClient(path=CHROMA_DB_PATH, settings=Settings(anonymized_telemetry=False))
     collection = client.get_or_create_collection(
         name=COLLECTION_NAME,
         metadata={"description": "India Housing Prices RAG Collection"},

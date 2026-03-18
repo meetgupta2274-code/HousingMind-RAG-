@@ -4,6 +4,7 @@ RAG Engine: Query ChromaDB and generate answers using Groq LLM.
 
 import os
 import chromadb
+from chromadb.config import Settings
 from groq import Groq
 from dotenv import load_dotenv
 
@@ -34,7 +35,7 @@ Guidelines:
 
 def get_chroma_collection():
     """Get the ChromaDB collection."""
-    client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+    client = chromadb.PersistentClient(path=CHROMA_DB_PATH, settings=Settings(anonymized_telemetry=False))
     return client.get_collection(COLLECTION_NAME)
 
 
