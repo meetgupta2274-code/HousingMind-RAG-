@@ -1,19 +1,19 @@
 """
-RAG Engine: Query ChromaDB and generate answers using Groq LLM.
+RAG Engine: Query Qdrant Cloud and generate answers using Groq LLM.
 """
 
 import os
-import chromadb
-from chromadb.config import Settings
+import time
+import requests
+from qdrant_client import QdrantClient
 from groq import Groq
 from dotenv import load_dotenv
 
 load_dotenv()
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_DIR = os.path.dirname(BASE_DIR)
-CHROMA_DB_PATH = os.path.join(PROJECT_DIR, "chroma_db")
 COLLECTION_NAME = "housing_data"
+HF_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+HF_API_URL = f"https://router.huggingface.co/hf-inference/models/{HF_MODEL}/pipeline/feature-extraction"
 
 # Token limit management
 MAX_CONTEXT_CHARS = 6000  # ~1500 tokens for context
@@ -33,32 +33,66 @@ Guidelines:
 - Always mention the city/state when discussing properties"""
 
 
-def get_chroma_collection():
-    """Get the ChromaDB collection."""
-    client = chromadb.PersistentClient(path=CHROMA_DB_PATH, settings=Settings(anonymized_telemetry=False))
-    return client.get_collection(COLLECTION_NAME)
+def get_qdrant_client() -> QdrantClient:
+    """Create and return a Qdrant cloud client."""
+    url = os.getenv("QDRANT_URL")
+    api_key = os.getenv("QDRANT_API_KEY")
+    if not url or not api_key:
+        raise ValueError("QDRANT_URL and QDRANT_API_KEY must be set in environment variables.")
+    return QdrantClient(url=url, api_key=api_key, timeout=120)
 
 
-def query_vectordb(question: str, n_results: int = 5) -> dict:
-    """Query ChromaDB for relevant documents."""
-    collection = get_chroma_collection()
-    results = collection.query(
-        query_texts=[question],
-        n_results=n_results,
+def get_embedding(text: str) -> list[float]:
+    """Get embedding for a single query text from HuggingFace Inference API."""
+    hf_token = os.getenv("HF_TOKEN")
+    if not hf_token:
+        raise ValueError("HF_TOKEN must be set in environment variables.")
+
+    headers = {"Authorization": f"Bearer {hf_token}"}
+    payload = {"inputs": text, "options": {"wait_for_model": True}}
+
+    for attempt in range(3):
+        response = requests.post(HF_API_URL, headers=headers, json=payload, timeout=30)
+        if response.status_code == 200:
+            result = response.json()
+            # HF returns list of token embeddings — take the mean for sentence embedding
+            if isinstance(result[0], list):
+                embedding = [sum(x) / len(result) for x in zip(*result)]
+            else:
+                embedding = result
+            return embedding
+        elif response.status_code == 503:
+            wait = response.json().get("estimated_time", 20)
+            time.sleep(min(wait, 30))
+        else:
+            raise RuntimeError(f"HF API error {response.status_code}: {response.text}")
+
+    raise RuntimeError("HF API failed after 3 retries.")
+
+
+def query_vectordb(question: str, n_results: int = 5) -> list:
+    """Query Qdrant for relevant documents."""
+    client = get_qdrant_client()
+    query_vector = get_embedding(question)
+    results = client.search(
+        collection_name=COLLECTION_NAME,
+        query_vector=query_vector,
+        limit=n_results,
+        with_payload=True,
     )
     return results
 
 
-def build_context(results: dict) -> str:
-    """Build context string from ChromaDB query results, respecting token limits."""
-    if not results or not results.get("documents") or not results["documents"][0]:
+def build_context(results: list) -> str:
+    """Build context string from Qdrant search results, respecting token limits."""
+    if not results:
         return "No relevant data found."
 
-    documents = results["documents"][0]
     context_parts = []
     current_length = 0
 
-    for i, doc in enumerate(documents):
+    for i, hit in enumerate(results):
+        doc = hit.payload.get("text", "")
         entry = f"Property {i + 1}: {doc}"
         if current_length + len(entry) > MAX_CONTEXT_CHARS:
             break
@@ -68,20 +102,18 @@ def build_context(results: dict) -> str:
     return "\n\n".join(context_parts)
 
 
-def build_sources(results: dict) -> list:
-    """Extract source metadata from results."""
-    if not results or not results.get("metadatas") or not results["metadatas"][0]:
-        return []
-
+def build_sources(results: list) -> list:
+    """Extract source metadata from Qdrant results."""
     sources = []
-    for meta in results["metadatas"][0]:
+    for hit in results:
+        payload = hit.payload or {}
         sources.append({
-            "city": meta.get("city", "Unknown"),
-            "state": meta.get("state", "Unknown"),
-            "property_type": meta.get("property_type", "Unknown"),
-            "bhk": meta.get("bhk", "N/A"),
-            "price_lakhs": meta.get("price_lakhs", "N/A"),
-            "size_sqft": meta.get("size_sqft", "N/A"),
+            "city": payload.get("city", "Unknown"),
+            "state": payload.get("state", "Unknown"),
+            "property_type": payload.get("property_type", "Unknown"),
+            "bhk": payload.get("bhk", "N/A"),
+            "price_lakhs": payload.get("price_lakhs", "N/A"),
+            "size_sqft": payload.get("size_sqft", "N/A"),
         })
     return sources
 
@@ -89,9 +121,10 @@ def build_sources(results: dict) -> list:
 def query_with_llm(question: str) -> dict:
     """
     Full RAG pipeline:
-    1. Query ChromaDB for relevant documents
-    2. Build context from results
-    3. Send to Groq LLM for answer generation
+    1. Embed the question via HuggingFace API
+    2. Query Qdrant for relevant documents
+    3. Build context from results
+    4. Send to Groq LLM for answer generation
     """
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key or api_key == "your_groq_api_key_here":
@@ -104,7 +137,7 @@ def query_with_llm(question: str) -> dict:
     # Step 1: Query vector DB
     results = query_vectordb(question, n_results=5)
 
-    # Step 2: Build context
+    # Step 2: Build context and sources
     context = build_context(results)
     sources = build_sources(results)
 
@@ -141,7 +174,6 @@ Provide a helpful, accurate answer based on the data above. If the data is insuf
 
     except Exception as e:
         error_msg = str(e)
-        # Handle rate limiting gracefully
         if "rate_limit" in error_msg.lower() or "429" in error_msg:
             return {
                 "answer": "⚠️ Rate limit reached. Please wait a moment and try again.",

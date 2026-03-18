@@ -22,7 +22,7 @@ async def lifespan(app: FastAPI):
     if is_already_ingested():
         app_state["ingestion_status"] = "ready"
         app_state["doc_count"] = get_collection_count()
-        print(f"✅ ChromaDB ready with {app_state['doc_count']} documents")
+        print(f"✅ Qdrant ready with {app_state['doc_count']} documents")
     else:
         app_state["ingestion_status"] = "not_ingested"
         print("⚠️ No embeddings found. Call POST /api/ingest to create them.")

@@ -108,7 +108,7 @@ export default function App() {
 
   async function checkHealth() {
     try {
-      const res = await axios.get(`${API_BASE}/health`, { timeout: 5000 })
+      const res = await axios.get(`${API_BASE}/health`, { timeout: 15000 })
       setDbStatus(res.data)
     } catch {
       setDbStatus({ status: 'error', ingestion_status: 'offline', doc_count: 0 })

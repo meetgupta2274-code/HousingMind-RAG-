@@ -1,21 +1,63 @@
 """
-Ingest CSV data into ChromaDB with persistent storage.
+Ingest CSV data into Qdrant Cloud with Hugging Face embeddings.
 Converts housing data rows into natural language chunks and embeds in batches of 30.
 """
 
 import os
+import time
+import requests
 import pandas as pd
-import chromadb
-from chromadb.config import Settings
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams, PointStruct
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Paths
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(BASE_DIR)
 DATA_PATH = os.path.join(PROJECT_DIR, "data", "india_housing_prices.csv")
-CHROMA_DB_PATH = os.path.join(PROJECT_DIR, "chroma_db")
+
 COLLECTION_NAME = "housing_data"
 BATCH_SIZE = 30
 SAMPLE_SIZE = 5000
+VECTOR_SIZE = 384  # all-MiniLM-L6-v2 output size
+
+HF_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+HF_API_URL = f"https://router.huggingface.co/hf-inference/models/{HF_MODEL}/pipeline/feature-extraction"
+
+
+def get_qdrant_client() -> QdrantClient:
+    """Create and return a Qdrant cloud client."""
+    url = os.getenv("QDRANT_URL")
+    api_key = os.getenv("QDRANT_API_KEY")
+    if not url or not api_key:
+        raise ValueError("QDRANT_URL and QDRANT_API_KEY must be set in environment variables.")
+    return QdrantClient(url=url, api_key=api_key, timeout=120)
+
+
+def get_embeddings(texts: list[str]) -> list[list[float]]:
+    """Get embeddings from Hugging Face Inference API."""
+    hf_token = os.getenv("HF_TOKEN")
+    if not hf_token:
+        raise ValueError("HF_TOKEN must be set in environment variables.")
+
+    headers = {"Authorization": f"Bearer {hf_token}"}
+    payload = {"inputs": texts, "options": {"wait_for_model": True}}
+
+    for attempt in range(3):
+        response = requests.post(HF_API_URL, headers=headers, json=payload, timeout=60)
+        if response.status_code == 200:
+            return response.json()
+        elif response.status_code == 503:
+            # Model loading, wait and retry
+            wait = response.json().get("estimated_time", 20)
+            print(f"  HF model loading, waiting {wait:.0f}s...")
+            time.sleep(min(wait, 30))
+        else:
+            raise RuntimeError(f"HF API error {response.status_code}: {response.text}")
+
+    raise RuntimeError("HF API failed after 3 retries.")
 
 
 def row_to_text(row: dict) -> str:
@@ -67,28 +109,23 @@ def row_to_text(row: dict) -> str:
 
 
 def is_already_ingested() -> bool:
-    """Check if the ChromaDB collection already has data."""
-    if not os.path.exists(CHROMA_DB_PATH):
-        return False
+    """Check if the Qdrant collection already has data."""
     try:
-        client = chromadb.PersistentClient(path=CHROMA_DB_PATH, settings=Settings(anonymized_telemetry=False))
-        collections = client.list_collections()
-        for col in collections:
-            if col.name == COLLECTION_NAME:
-                collection = client.get_collection(COLLECTION_NAME)
-                count = collection.count()
-                return count > 0
-        return False
+        client = get_qdrant_client()
+        collections = [c.name for c in client.get_collections().collections]
+        if COLLECTION_NAME not in collections:
+            return False
+        count = client.count(collection_name=COLLECTION_NAME).count
+        return count > 0
     except Exception:
         return False
 
 
 def get_collection_count() -> int:
-    """Get the number of documents in the collection."""
+    """Get the number of documents in the Qdrant collection."""
     try:
-        client = chromadb.PersistentClient(path=CHROMA_DB_PATH, settings=Settings(anonymized_telemetry=False))
-        collection = client.get_collection(COLLECTION_NAME)
-        return collection.count()
+        client = get_qdrant_client()
+        return client.count(collection_name=COLLECTION_NAME).count
     except Exception:
         return 0
 
@@ -98,7 +135,8 @@ def ingest_data() -> dict:
     Main ingestion function.
     - Reads CSV, samples ~5000 rows stratified by State
     - Converts each row to text
-    - Embeds in batches of 30 into ChromaDB (persistent)
+    - Embeds via HuggingFace API in batches of 30
+    - Upserts vectors into Qdrant Cloud
     Returns status dict with count and message.
     """
     if is_already_ingested():
@@ -120,7 +158,6 @@ def ingest_data() -> dict:
     state_counts = df["State"].value_counts()
     for state in state_counts.index:
         state_df = df[df["State"] == state]
-        # proportional sampling
         n_sample = max(1, int(SAMPLE_SIZE * len(state_df) / total_rows))
         if n_sample > len(state_df):
             n_sample = len(state_df)
@@ -129,11 +166,13 @@ def ingest_data() -> dict:
     sampled_df = pd.concat(sampled_dfs, ignore_index=True)
     print(f"Sampled {len(sampled_df)} rows across {sampled_df['State'].nunique()} states")
 
+    # Free the full dataframe from memory immediately
+    del df
+
     # Convert rows to text chunks
     print("Converting rows to text chunks...")
     documents = []
     metadatas = []
-    ids = []
 
     for idx, row in sampled_df.iterrows():
         text = row_to_text(row.to_dict())
@@ -145,41 +184,58 @@ def ingest_data() -> dict:
             "bhk": str(row.get("BHK", "")),
             "price_lakhs": str(row.get("Price_in_Lakhs", "")),
             "size_sqft": str(row.get("Size_in_SqFt", "")),
+            "text": text,
         })
-        ids.append(f"doc_{idx}")
 
-    # Create ChromaDB client with persistent storage
-    print(f"Creating ChromaDB persistent client at: {CHROMA_DB_PATH}")
-    client = chromadb.PersistentClient(path=CHROMA_DB_PATH, settings=Settings(anonymized_telemetry=False))
-    collection = client.get_or_create_collection(
-        name=COLLECTION_NAME,
-        metadata={"description": "India Housing Prices RAG Collection"},
+    # Free the dataframe from memory
+    del sampled_df
+
+    # Create Qdrant collection
+    print("Connecting to Qdrant Cloud and creating collection...")
+    client = get_qdrant_client()
+    collections = [c.name for c in client.get_collections().collections]
+    if COLLECTION_NAME in collections:
+        client.delete_collection(COLLECTION_NAME)
+
+    client.create_collection(
+        collection_name=COLLECTION_NAME,
+        vectors_config=VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE),
     )
 
-    # Embed in batches of 30
+    # Embed and upsert in batches of 30
     total_docs = len(documents)
     total_batches = (total_docs + BATCH_SIZE - 1) // BATCH_SIZE
     print(f"Embedding {total_docs} documents in {total_batches} batches of {BATCH_SIZE}...")
 
+    point_id = 0
     for i in range(0, total_docs, BATCH_SIZE):
         batch_end = min(i + BATCH_SIZE, total_docs)
         batch_num = (i // BATCH_SIZE) + 1
+        batch_texts = documents[i:batch_end]
+        batch_metas = metadatas[i:batch_end]
 
-        collection.add(
-            documents=documents[i:batch_end],
-            metadatas=metadatas[i:batch_end],
-            ids=ids[i:batch_end],
-        )
+        embeddings = get_embeddings(batch_texts)
+
+        points = []
+        for j, (embedding, meta) in enumerate(zip(embeddings, batch_metas)):
+            points.append(PointStruct(
+                id=point_id,
+                vector=embedding,
+                payload=meta,
+            ))
+            point_id += 1
+
+        client.upsert(collection_name=COLLECTION_NAME, points=points)
 
         if batch_num % 20 == 0 or batch_num == total_batches:
             print(f"  Batch {batch_num}/{total_batches} done ({batch_end}/{total_docs} docs)")
 
-    final_count = collection.count()
-    print(f"Ingestion complete! {final_count} documents stored in ChromaDB.")
+    final_count = client.count(collection_name=COLLECTION_NAME).count
+    print(f"Ingestion complete! {final_count} documents stored in Qdrant Cloud.")
 
     return {
         "status": "success",
-        "message": f"Successfully ingested {final_count} documents into ChromaDB.",
+        "message": f"Successfully ingested {final_count} documents into Qdrant Cloud.",
         "count": final_count,
     }
 
