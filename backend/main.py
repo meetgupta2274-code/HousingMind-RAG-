@@ -87,6 +87,13 @@ async def health_check():
     )
 
 
+@app.head("/health")
+@app.get("/health")
+async def uptime_health():
+    """Lightweight health endpoint for uptime monitors (HEAD/GET)."""
+    return {"status": "ok"}
+
+
 @app.post("/api/ingest", response_model=IngestResponse)
 async def run_ingestion():
     """Trigger data ingestion into ChromaDB."""

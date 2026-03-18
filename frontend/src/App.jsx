@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import axios from 'axios'
 import ReactMarkdown from 'react-markdown'
 
-const API_BASE = 'http://localhost:8000/api'
+const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000/api'
 
 const SUGGESTED_QUESTIONS = [
   { emoji: '💰', text: 'What is the average price of a 3 BHK apartment in Mumbai?' },
